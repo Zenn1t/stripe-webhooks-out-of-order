@@ -1,0 +1,114 @@
+// MariaDB + Prisma. Two layers, deliberately separated:
+//   1. transport/inbox  -> stripe_events            (what Stripe told us)
+//   2. payment state    -> stripe_subscriptions     (mirror of Stripe truth)
+//   3. business state   -> entitlements             (what WE decided it means)
+//
+// Rule: nothing downstream of the inbox ever reads event.data.object.
+// The event carries an ID and a type. State always comes from a fresh API read.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+/// ---------------------------------------------------------------------------
+/// LAYER 1 — INBOX (transactional inbox / idempotent consumer)
+/// ---------------------------------------------------------------------------
+model StripeEvent {
+  /// evt_... — PRIMARY KEY is the whole duplicate-delivery defence.
+  /// INSERT IGNORE on a PK is atomic; a SELECT-then-INSERT is not
+  /// (two concurrent redeliveries both pass the SELECT).
+  id          String    @id @db.VarChar(64)
+
+  type        String    @db.VarChar(120)
+  /// data.object.id — the FIFO key. All events about one object are
+  /// processed serially, which is what actually removes the ordering hazard.
+  objectId    String    @db.VarChar(120)
+  apiVersion  String?   @db.VarChar(32)
+
+  /// Stored for forensics only. Business logic MUST NOT read this.
+  payload     Json
+
+  receivedAt  DateTime  @default(now())
+  /// Worker lease. NULL = free, set = someone is working on it.
+  claimedAt   DateTime?
+  processedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?   @db.Text
+
+  @@index([processedAt, receivedAt])
+  @@index([objectId, processedAt])
+  @@map("stripe_events")
+}
+
+/// ---------------------------------------------------------------------------
+/// LAYER 2 — PAYMENT STATE (a mirror of Stripe, never of the payload)
+/// ---------------------------------------------------------------------------
+model StripeSubscription {
+  id                 String    @id @db.VarChar(120) // sub_...
+  customerId         String    @db.VarChar(120)
+  status             String    @db.VarChar(32)      // active|past_due|canceled|...
+  priceId            String?   @db.VarChar(120)
+  quantity           Int       @default(1)
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean   @default(false)
+  canceledAt         DateTime?
+  /// Monotonic guard. Incremented inside the row lock on every projection.
+  /// Never derived from event.created — Stripe documents that `created` has
+  /// second resolution and explicitly says not to use it for ordering.
+  syncVersion        BigInt    @default(0)
+  /// Wall-clock of the API read that produced this row.
+  syncedAt           DateTime  @default(now())
+  /// True when Stripe returned 404 — the subscription is gone for good.
+  deleted            Boolean   @default(false)
+
+  @@index([customerId])
+  @@map("stripe_subscriptions")
+}
+
+/// Advisory lock rows. One per Stripe object we serialise on.
+/// Exists so SELECT ... FOR UPDATE always has a row to lock, even before
+/// the mirror row exists (first event for a brand-new subscription).
+model SyncLock {
+  objectId  String   @id @db.VarChar(120)
+  updatedAt DateTime @updatedAt
+
+  @@map("sync_locks")
+}
+
+/// ---------------------------------------------------------------------------
+/// LAYER 3 — BUSINESS STATE (pure function of layer 2)
+/// ---------------------------------------------------------------------------
+model Entitlement {
+  accountId    String    @id @db.VarChar(120)
+  plan         String    @db.VarChar(64)   // "free" | "pro" | ...
+  accessUntil  DateTime?
+  /// Which subscription this decision was derived from.
+  sourceSubId  String?   @db.VarChar(120)
+  updatedAt    DateTime  @updatedAt
+
+  @@map("entitlements")
+}
+
+/// Cursor for the reconciler (catch-up over the /v1/events list API).
+model ReconcilerCursor {
+  id            String   @id @default("stripe")
+  lastEventId   String?  @db.VarChar(64)
+  lastRunAt     DateTime @default(now())
+
+  @@map("reconciler_cursors")
+}
+
+/// The application's own user/org table, included only because the projector
+/// has to map a Stripe customer onto something. In a real codebase this row
+/// already exists and belongs to you, not to this repo.
+model Account {
+  id               String  @id @db.VarChar(120)
+  stripeCustomerId String? @unique @db.VarChar(120)
+
+  @@map("accounts")
+}

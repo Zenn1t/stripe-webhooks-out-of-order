@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.env
+.env.*
+!.env.example
+fixtures/*.jsonl
+
+.DS_Store

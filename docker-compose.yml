@@ -1,0 +1,14 @@
+# Throwaway MariaDB for the test suite. `npm run db:up` starts it.
+services:
+  db:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: stripe
+      MARIADB_DATABASE: stripe_hardening
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
